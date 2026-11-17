@@ -89,16 +89,17 @@ def ingest_workbook(
             shutil.rmtree(backup, ignore_errors=True)
             backup = None
         return destination
-    except Exception:
-        if backup is not None and backup.exists() and not destination.exists():
-            backup.replace(destination)
-            backup = None
+    except BaseException:
+        _restore_backup(backup, destination)
+        backup = None
         raise
     finally:
         if staging_pending and staging.exists():
             shutil.rmtree(staging, ignore_errors=True)
-        if backup is not None and backup.exists():
-            shutil.rmtree(backup, ignore_errors=True)
+        # Never delete a leftover backup here: if the swap failed or was interrupted,
+        # keep it so the previous vault can be restored manually or by _restore_backup.
+        if backup is not None and backup.exists() and not destination.exists():
+            _restore_backup(backup, destination)
 
 
 def _write_case(destination: Path, formulas, cached, source_name: str, date_stamp: str, iso: str) -> None:
@@ -291,13 +292,24 @@ def _sheet_markdown(formula_ws, cached_ws) -> str:
     return "\n\n".join(blocks) if blocks else "_Leeres Blatt._"
 
 
+def _restore_backup(backup: Path | None, destination: Path) -> None:
+    """Put the previous vault back if the destination is missing."""
+    if backup is None or not backup.exists() or destination.exists():
+        return
+    try:
+        backup.replace(destination)
+    except OSError:
+        # Leave the backup directory in place for manual recovery.
+        pass
+
+
 def _rows(formula_ws, cached_ws) -> list[list[str]]:
-    """Read only the used cell grid, not an inflated Excel dimension."""
-    min_row, max_row, min_col, max_col = _used_bounds(formula_ws, cached_ws)
+    """Read used rows from column A so index 0 stays column A for heading detection."""
+    min_row, max_row, _min_col, max_col = _used_bounds(formula_ws, cached_ws)
     rows = []
     for r in range(min_row, max_row + 1):
         row = []
-        for c in range(min_col, max_col + 1):
+        for c in range(1, max_col + 1):
             cached = cached_ws.cell(r, c).value
             raw = formula_ws.cell(r, c).value
             row.append(_cell(cached, raw))

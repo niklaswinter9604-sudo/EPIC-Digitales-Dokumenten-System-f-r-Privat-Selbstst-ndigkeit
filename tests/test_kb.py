@@ -139,5 +139,77 @@ class KnowledgeBaseTest(unittest.TestCase):
             self.assertLess(elapsed, 0.5)
 
 
+    def test_column_a_remains_heading_anchor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            workbook = Path(tmp) / "cols.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "Spalten"
+            sheet["B1"] = "SpalteB"
+            sheet["C1"] = "SpalteC"
+            sheet["B2"] = "nur B"
+            sheet["A3"] = "Echte Ueberschrift"
+            sheet["A4"] = "x"
+            sheet["B4"] = "y"
+            book.save(workbook)
+            loaded = load_workbook(workbook)["Spalten"]
+            markdown = __import__("doksys.ingest", fromlist=["_sheet_markdown"])._sheet_markdown(loaded, loaded)
+            self.assertIn("| SpalteB | SpalteC |", markdown)
+            self.assertIn("| nur B |", markdown)
+            self.assertNotIn("### nur B", markdown)
+            self.assertIn("### Echte Ueberschrift", markdown)
+
+    def test_interrupted_swap_restores_backup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            first = Path(tmp) / "Alt_2026-11-17.xlsx"
+            book = Workbook()
+            sheet = book.active
+            sheet.title = "Alt"
+            sheet["A1"] = "Bleibt"
+            book.save(first)
+
+            destination = ROOT / "private" / "cases" / "unittest-interrupt"
+            shutil.rmtree(destination, ignore_errors=True)
+            try:
+                ingest_workbook(first, destination, repo=ROOT)
+                original = (destination / "topics" / "alt" / "alt.md").read_text(encoding="utf-8")
+
+                second = Path(tmp) / "Neu_2026-11-17.xlsx"
+                book = Workbook()
+                sheet = book.active
+                sheet.title = "Neu"
+                sheet["A1"] = "Neu"
+                book.save(second)
+
+                import doksys.ingest as ingest_mod
+                real_replace = Path.replace
+
+                def boom(self, target):
+                    if self.name.startswith(".unittest-interrupt.staging-"):
+                        raise KeyboardInterrupt("simulated during staging swap")
+                    return real_replace(self, target)
+
+                try:
+                    Path.replace = boom  # type: ignore[method-assign]
+                    with self.assertRaises(KeyboardInterrupt):
+                        ingest_workbook(second, destination, repo=ROOT)
+                finally:
+                    Path.replace = real_replace  # type: ignore[method-assign]
+
+                self.assertTrue(destination.exists())
+                restored = (destination / "topics" / "alt" / "alt.md").read_text(encoding="utf-8")
+                self.assertEqual(restored, original)
+                leftovers = [
+                    path.name
+                    for path in destination.parent.iterdir()
+                    if path.name.startswith(".unittest-interrupt.")
+                ]
+                self.assertEqual(leftovers, [])
+            finally:
+                shutil.rmtree(destination, ignore_errors=True)
+                for path in (ROOT / "private" / "cases").glob(".unittest-interrupt.*"):
+                    shutil.rmtree(path, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main()
