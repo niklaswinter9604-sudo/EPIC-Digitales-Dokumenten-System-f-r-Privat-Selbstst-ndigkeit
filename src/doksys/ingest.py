@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import re
+import shutil
 import subprocess
+import tempfile
 import unicodedata
 from datetime import date, datetime
 from pathlib import Path
 
 from openpyxl import load_workbook
+from openpyxl.worksheet.worksheet import Worksheet
 
 from doksys.kb import validate
 
@@ -36,7 +39,7 @@ def ingest_workbook(
     case_date: date | None = None,
     ignored: callable | None = None,
 ) -> Path:
-    """Write one note per sheet. Refuse a destination Git would commit."""
+    """Write one note per worksheet into a replaced, gitignored case vault."""
     destination = destination.resolve()
     repo = (repo or _find_repo(destination)).resolve()
     if destination == repo or repo not in destination.parents:
@@ -46,25 +49,78 @@ def ingest_workbook(
         raise ValueError(
             f"Refusing to write {destination}. Case files belong in a gitignored folder such as private/cases/."
         )
+
     created = case_date or _workbook_date(workbook)
     date_stamp = created.strftime("%Y%m%d")
     iso = created.isoformat()
     formulas = load_workbook(workbook, data_only=False)
     cached = load_workbook(workbook, data_only=True)
-    destination.mkdir(parents=True, exist_ok=True)
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(
+        tempfile.mkdtemp(
+            prefix=f".{destination.name}.staging-",
+            dir=destination.parent,
+        )
+    )
+    backup: Path | None = None
+    staging_pending = True
+    try:
+        if not check(staging):
+            raise ValueError(
+                f"Refusing to write staging dir {staging}. Case files belong in a gitignored folder such as private/cases/."
+            )
+        _write_case(staging, formulas, cached, workbook.name, date_stamp, iso)
+        report = validate(staging)
+        if not report.ok:
+            raise RuntimeError("Generated case failed validation:\n" + "\n".join(report.errors))
+        if destination.exists():
+            backup = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{destination.name}.backup-",
+                    dir=destination.parent,
+                )
+            )
+            shutil.rmtree(backup)
+            destination.replace(backup)
+        staging.replace(destination)
+        staging_pending = False
+        if backup is not None:
+            shutil.rmtree(backup, ignore_errors=True)
+            backup = None
+        return destination
+    except Exception:
+        if backup is not None and backup.exists() and not destination.exists():
+            backup.replace(destination)
+            backup = None
+        raise
+    finally:
+        if staging_pending and staging.exists():
+            shutil.rmtree(staging, ignore_errors=True)
+        if backup is not None and backup.exists():
+            shutil.rmtree(backup, ignore_errors=True)
+
+
+def _write_case(destination: Path, formulas, cached, source_name: str, date_stamp: str, iso: str) -> None:
     topics = destination / "topics"
-    topics.mkdir(exist_ok=True)
+    topics.mkdir(parents=True, exist_ok=True)
     notes: list[dict] = []
     used_slugs: set[str] = {"fallakte"}
-    for name in formulas.sheetnames:
+    for worksheet in formulas.worksheets:
+        if not isinstance(worksheet, Worksheet):
+            continue
+        name = worksheet.title
+        cached_ws = cached[name]
+        if not isinstance(cached_ws, Worksheet):
+            continue
         slug = _unique_slug(_slug(name), used_slugs)
         used_slugs.add(slug)
         note_id = f"{date_stamp}-{slug}"
         title = _clean(name)
-        summary = _summary(cached[name], title)
+        summary = _summary(cached_ws, title)
         topic = topics / slug
         topic.mkdir(exist_ok=True)
-        body = _sheet_markdown(formulas[name], cached[name])
+        body = _sheet_markdown(worksheet, cached_ws)
         note_path = topic / f"{slug}.md"
         note_path.write_text(
             _note(
@@ -73,7 +129,7 @@ def ingest_workbook(
                 summary=summary,
                 iso=iso,
                 body=body,
-                source=workbook.name,
+                source=source_name,
             ),
             encoding="utf-8",
         )
@@ -91,15 +147,13 @@ def ingest_workbook(
                 "path": f"topics/{slug}/{slug}.md",
             }
         )
-    overview = _write_overview(destination, notes, date_stamp, iso, workbook.name)
+    if not notes:
+        raise ValueError(f"{source_name}: no worksheets to ingest")
+    overview = _write_overview(destination, notes, date_stamp, iso, source_name)
     _link_sheets_to_overview(destination, notes, overview)
     (destination / "INDEX.md").write_text(
-        _index([overview, *notes], workbook.name, iso), encoding="utf-8"
+        _index([overview, *notes], source_name, iso), encoding="utf-8"
     )
-    report = validate(destination)
-    if not report.ok:
-        raise RuntimeError("Generated case failed validation:\n" + "\n".join(report.errors))
-    return destination
 
 
 def _write_overview(destination: Path, notes: list[dict], date_stamp: str, iso: str, source: str) -> dict:
@@ -238,17 +292,33 @@ def _sheet_markdown(formula_ws, cached_ws) -> str:
 
 
 def _rows(formula_ws, cached_ws) -> list[list[str]]:
+    """Read only the used cell grid, not an inflated Excel dimension."""
+    min_row, max_row, min_col, max_col = _used_bounds(formula_ws, cached_ws)
     rows = []
-    max_row = max(formula_ws.max_row or 1, cached_ws.max_row or 1)
-    max_col = max(formula_ws.max_column or 1, cached_ws.max_column or 1)
-    for r in range(1, max_row + 1):
+    for r in range(min_row, max_row + 1):
         row = []
-        for c in range(1, max_col + 1):
+        for c in range(min_col, max_col + 1):
             cached = cached_ws.cell(r, c).value
             raw = formula_ws.cell(r, c).value
             row.append(_cell(cached, raw))
         rows.append(row)
     return rows
+
+
+def _used_bounds(*worksheets) -> tuple[int, int, int, int]:
+    """Bounds from cells that hold values, ignoring style-only outliers."""
+    coords = []
+    for worksheet in worksheets:
+        cells = getattr(worksheet, "_cells", None) or {}
+        for (row, col), cell in cells.items():
+            if cell.value is None:
+                continue
+            coords.append((row, col))
+    if not coords:
+        return 1, 1, 1, 1
+    rows = [row for row, _ in coords]
+    cols = [col for _, col in coords]
+    return min(rows), max(rows), min(cols), max(cols)
 
 
 def _cell(cached, raw) -> str:
@@ -280,7 +350,12 @@ def _table(rows: list[list[str]]) -> str:
 
 
 def _summary(worksheet, title: str) -> str:
-    for row in worksheet.iter_rows(max_row=min(worksheet.max_row or 1, 8), max_col=min(worksheet.max_column or 1, 4)):
+    min_row, max_row, min_col, max_col = _used_bounds(worksheet)
+    max_row = min(max_row, min_row + 7)
+    max_col = min(max_col, min_col + 3)
+    for row in worksheet.iter_rows(
+        min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col
+    ):
         for cell in row:
             if isinstance(cell.value, str):
                 text = " ".join(cell.value.split())
