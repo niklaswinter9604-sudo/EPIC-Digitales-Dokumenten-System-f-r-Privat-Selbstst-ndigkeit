@@ -1,0 +1,7 @@
+/private/*
+!/private/README.md
+*.pages
+__pycache__/
+.pytest_cache/
+*.pyc
+.venv/
